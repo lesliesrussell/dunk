@@ -9,7 +9,7 @@ brew install lesliesrussell/tap/dunk
 dunk
 ```
 
-The formula lives in [lesliesrussell/homebrew-tap](https://github.com/lesliesrussell/homebrew-tap). It builds the checksummed release source with Rust. To update or remove:
+The formula lives in [lesliesrussell/homebrew-tap](https://github.com/lesliesrussell/homebrew-tap). Prebuilt bottles are available for Apple Silicon macOS and x86_64 Linux. Systems without a compatible bottle build the checksummed release source with Rust. To update or remove:
 
 ```sh
 brew update
