@@ -62,7 +62,7 @@ The top-level `justfile` is the command interface (validated with just 1.59.0). 
 
 ### Prerequisites and fresh checkout
 
-Supported workflow: macOS with Homebrew and a Unix shell. The shell recipes and PTY test also target Linux, but this project has only been verified on macOS; Homebrew casks are macOS-specific. Native Windows is unsupported by the PTY test.
+Supported workflow: macOS or Linux with Homebrew and a Unix shell. GitHub Actions validates the Rust checks, PTY test, and release build on macOS and Linux. Homebrew casks are macOS-specific. Native Windows is unsupported by the PTY test.
 
 Install prerequisites explicitly, outside setup:
 
