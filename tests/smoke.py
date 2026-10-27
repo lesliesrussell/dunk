@@ -76,11 +76,26 @@ formulae) printf 'alpha\\nbeta\\n' ;;
 casks) printf 'gamma\\nomega\\n' ;;
 info)
  if [ "$2" = '--json=v2' ]; then
-  printf '%s\\n' '{"formulae":[{"name":"beta","full_name":"beta","outdated":true,"desc":"Beta package"}],"casks":[{"token":"omega","outdated":true,"desc":"Omega cask"}]}'
+  formula=''
+  cask=''
+  if [ -f "$DUNK_RECORD.tap" ]; then
+   formula=',{"name":"widget","full_name":"acme/tools/widget","outdated":false}'
+  fi
+  if [ -f "$DUNK_RECORD.cask" ]; then
+   cask=',{"token":"viewer","full_token":"acme/tools/viewer","outdated":false}'
+  fi
+  printf '{"formulae":[{"name":"beta","full_name":"beta","outdated":true,"desc":"Beta package"}%s],"casks":[{"token":"omega","outdated":true,"desc":"Omega cask"}%s]}\\n' "$formula" "$cask"
  else
   printf 'Package information and caveats\\n'
  fi ;;
-install|upgrade|uninstall) printf 'Operation completed\\n' ;;
+install)
+ case "$*" in
+  'install acme/tools/widget') : > "$DUNK_RECORD.tap" ;;
+  'install --cask acme/tools/viewer') : > "$DUNK_RECORD.cask" ;;
+  'install acme/tools/fail') printf 'Package not found\\n' >&2; exit 1 ;;
+ esac
+ printf 'Operation completed\\n' ;;
+upgrade|uninstall) printf 'Operation completed\\n' ;;
 *) exit 1 ;;
 esac
 ''')
@@ -146,12 +161,55 @@ esac
         confirm_and_wait()
         os.write(master, b"\r")
         wait_for(b"Package information and caveats")
+        # Clear the earlier persistent marks before checking focused tap upgrades.
+        os.write(master, b"2/\x7f\x7f\x7f\x7f\x7f\r j ")
+        wait_for(b"0 marked")
+        # Tap input is modal, validates input, and supports cancellation.
+        before = record.read_text().splitlines()
+        os.write(master, b"t\r")
+        wait_for(b"Use owner/tap/package")
+        os.write(master, b"garbage\x15acme/tools/widgetx\x7f\r")
+        wait_for(b"Confirm: brew install acme/tools/widget")
+        assert record.read_text().splitlines() == before
+        os.write(master, b"n")
+        time.sleep(0.15)
+        assert record.read_text().splitlines() == before
+        os.write(master, b"tacme/tools/widget\r")
+        wait_for(b"Confirm: brew install acme/tools/widget")
+        confirm_and_wait()
+        assert "install acme/tools/widget" in record.read_text().splitlines()
+        wait_for(b"Packages (1)")
+        wait_for(b"acme/tools/widget")
+        # The automatically focused installed package retains its tap identity.
+        os.write(master, b"u")
+        wait_for(b"brew upgrade --formula acme/tools/widget")
+        os.write(master, b"n")
+        time.sleep(0.15)
+        # Explicit cask mode and full_token survive refresh and later upgrades.
+        os.write(master, b"tacme/tools/viewer\t\t\r")
+        wait_for(b"brew install --cask acme/tools/viewer")
+        confirm_and_wait()
+        wait_for(b"Packages (1)")
+        os.write(master, b"u")
+        wait_for(b"brew upgrade --cask acme/tools/viewer")
+        os.write(master, b"n")
+        time.sleep(0.15)
+        # A failed Brew install is visible and releases the busy lock.
+        os.write(master, b"tacme/tools/fail\r")
+        wait_for(b"Confirm: brew install acme/tools/fail")
+        confirm_and_wait()
+        wait_for(b"Package not found")
+        wait_for(b"acme/tools/viewer")
+        os.write(master, b"t")
+        wait_for(b"owner/tap/package, e.g.")
+        os.write(master, b"\x1b")
+        time.sleep(0.15)
         os.write(master, b"q")
         assert proc.wait(timeout=5) == 0
         commands = record.read_text()
         for command in ["install --formula alpha", "upgrade --formula beta", "uninstall --formula beta", "install --cask gamma", "info --cask gamma"]:
             assert command in commands, commands
-        print("PTY smoke passed: cancel, install, focused/marked/all upgrades, uninstall, cask, details, quit")
+        print("PTY smoke passed: cancel, install, focused/marked/all upgrades, uninstall, cask, details, tap installs/cancellation/errors, quit")
     finally:
         if proc.poll() is None:
             proc.kill()

@@ -36,6 +36,7 @@ Install the executable with `just install`. Run `just brew-check` for a read-onl
 | `1` / `2` / `3` | All / installed / outdated |
 | Enter | Load package information and caveats |
 | `i` | Install selected package |
+| `t` | Install from a tap using owner/tap/package |
 | `Space` | On Installed: mark/unmark the focused package |
 | `u` | On Installed: upgrade marked packages, or the focused package if none are marked |
 | `U` | On Installed: upgrade all installed packages |
@@ -43,6 +44,8 @@ Install the executable with `just install`. Run `just brew-check` for a read-onl
 | `y` | Confirm displayed Brew command |
 | `r` | Reload catalog and installed state |
 | `q`, Escape, Ctrl-C | Quit when idle |
+
+Press **`t`** in any view to install from a tap. Enter a full reference such as `lesliesrussell/tap/dunk`. Tab cycles **Auto**, **Formula**, and **Cask**; Auto lets Homebrew choose. Press Enter to review the exact command, then `y` to install or any other key to cancel. Escape cancels input; Backspace edits and Ctrl-U clears it. Homebrew adds the tap if needed, and dunk streams its output. On success, dunk opens Installed filtered to the installed package. Errors stay in the Brew output pane. Casks that require password entry must still be installed in a normal terminal.
 
 On **Installed** (`2`), use `Space` to mark multiple packages and `u` to upgrade them. With no marks, `u` upgrades the focused row. Marks persist when searching or switching tabs; the marked count appears above the list. Press `Space` on a marked row to unmark it. Marked upgrades include hidden marks and group formulae/casks into separate Brew commands; execution stops on the first failed command and refreshes installed state. Outside Installed, `u` still upgrades only the focused installed package.
 

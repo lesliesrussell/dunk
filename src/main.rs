@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
@@ -83,8 +83,9 @@ fn catalog() -> Result<Vec<Package>> {
     let info: Value = serde_json::from_str(&output(&["info", "--json=v2", "--installed"])?)?;
     for (key, cask) in [("formulae", false), ("casks", true)] {
         for p in info[key].as_array().into_iter().flatten() {
-            let name = p[if cask { "token" } else { "full_name" }]
+            let name = p[if cask { "full_token" } else { "full_name" }]
                 .as_str()
+                .or_else(|| p["token"].as_str())
                 .or_else(|| p["name"].as_str())
                 .context("Missing package name")?;
             let entry = packages.entry((cask, name.into())).or_insert(Package {
@@ -112,11 +113,64 @@ fn load(tx: Sender<Message>) {
         let _ = tx.send(Message::Catalog(catalog()));
     });
 }
+#[derive(Clone, Copy, Debug, Default)]
+enum InstallKind {
+    #[default]
+    Auto,
+    Formula,
+    Cask,
+}
+impl InstallKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Formula => "Formula",
+            Self::Cask => "Cask",
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Formula,
+            Self::Formula => Self::Cask,
+            Self::Cask => Self::Auto,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TapReference(String);
+impl TapReference {
+    fn parse(input: &str) -> Result<Self> {
+        let reference = input.trim();
+        let parts: Vec<_> = reference.split('/').collect();
+        if reference.len() > 255
+            || parts.len() != 3
+            || parts.iter().any(|part| {
+                !part
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                    || !part
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"-_.+@".contains(&c))
+            })
+        {
+            bail!("Use owner/tap/package (no spaces or flags).");
+        }
+        Ok(Self(reference.into()))
+    }
+}
+#[derive(Default)]
+struct TapInstall {
+    input: String,
+    kind: InstallKind,
+    error: String,
+}
 #[derive(Clone, Debug)]
 enum Operation {
     Package(Package, &'static str),
     UpgradeSelected(Vec<Package>),
     UpgradeAll,
+    InstallTap(TapReference, InstallKind),
 }
 impl Operation {
     fn commands(&self) -> Vec<Vec<String>> {
@@ -137,12 +191,23 @@ impl Operation {
                 })
                 .collect(),
             Self::UpgradeAll => vec![vec!["upgrade".into()]],
+            Self::InstallTap(reference, kind) => {
+                let mut args = vec!["install".into()];
+                match kind {
+                    InstallKind::Auto => {}
+                    InstallKind::Formula => args.push("--formula".into()),
+                    InstallKind::Cask => args.push("--cask".into()),
+                }
+                args.push(reference.0.clone());
+                vec![args]
+            }
         }
     }
     fn confirmation(&self) -> String {
         let scope = match self {
             Self::UpgradeAll => "Upgrade ALL installed formulae and casks eligible under Homebrew's normal upgrade rules. Includes packages hidden by search; ignores marked selections.\n\n".to_string(),
             Self::UpgradeSelected(packages) => format!("Upgrade {} selected package(s), including any marked packages hidden by search.\n\n", packages.len()),
+            Self::InstallTap(..) => "Install from tap. Homebrew will add the tap if needed.\n\n".to_string(),
             Self::Package(..) => String::new(),
         };
         format!(
@@ -214,6 +279,8 @@ struct App {
     confirm: Option<Operation>,
     marked: BTreeSet<(bool, String)>,
     detail: String,
+    tap_install: Option<TapInstall>,
+    focus_after_install: Option<String>,
 }
 impl App {
     fn new() -> Self {
@@ -229,6 +296,8 @@ impl App {
             confirm: None,
             marked: BTreeSet::new(),
             detail: String::new(),
+            tap_install: None,
+            focus_after_install: None,
         }
     }
     fn visible(&self) -> Vec<&Package> {
@@ -281,6 +350,40 @@ impl App {
             }
         }
     }
+    fn tap_input(&mut self, key: KeyEvent) {
+        let Some(dialog) = &mut self.tap_install else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.tap_install = None,
+            KeyCode::Enter => match TapReference::parse(&dialog.input) {
+                Ok(reference) => {
+                    self.confirm = Some(Operation::InstallTap(reference, dialog.kind));
+                    self.tap_install = None;
+                }
+                Err(e) => dialog.error = e.to_string(),
+            },
+            KeyCode::Tab => dialog.kind = dialog.kind.next(),
+            KeyCode::Backspace => {
+                dialog.input.pop();
+                dialog.error.clear();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.input.clear();
+                dialog.error.clear();
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && dialog.input.len() + c.len_utf8() <= 255 =>
+            {
+                dialog.input.push(c);
+                dialog.error.clear();
+            }
+            _ => {}
+        }
+    }
     fn draw(&self, f: &mut ratatui::Frame) {
         let areas = Layout::vertical([
             Constraint::Length(3),
@@ -316,11 +419,11 @@ impl App {
                 Line::from(navigation),
                 Line::raw(if self.tab == 1 {
                     format!(
-                        " Space mark · u upgrade selected · U upgrade all · {} marked",
+                        " Space mark · u upgrade selected · U upgrade all · t install from tap · {} marked",
                         self.marked.len()
                     )
                 } else {
-                    String::new()
+                    " t install from tap".into()
                 }),
             ])
             .style(Style::default().fg(Color::Cyan)),
@@ -373,7 +476,9 @@ impl App {
             cols[0],
             &mut state,
         );
-        let detail = if let Some(operation) = &self.confirm {
+        let detail = if let Some(dialog) = &self.tap_install {
+            format!("Install from tap\n\nowner/tap/package, e.g. lesliesrussell/tap/dunk\n\n> {}_\n\nType: {} (Tab to change)\nEnter: review · Esc: cancel · Ctrl-U: clear\n\n{}", dialog.input, dialog.kind.label(), dialog.error)
+        } else if let Some(operation) = &self.confirm {
             operation.confirmation()
         } else if !self.detail.is_empty() {
             self.detail.clone()
@@ -409,7 +514,7 @@ impl App {
             .block(Block::bordered().title(" Brew output ")),
             areas[2],
         );
-        f.render_widget(Paragraph::new(format!("{}\n j/k move · / search · 1/2/3 filter · Enter details · i install · u upgrade selected · X remove · r refresh · q quit",self.status)).wrap(Wrap { trim: true }), areas[3]);
+        f.render_widget(Paragraph::new(format!("{}\n j/k move · / search · 1/2/3 filter · Enter details · i install · t install from tap · u upgrade selected · X remove · r refresh · q quit",self.status)).wrap(Wrap { trim: true }), areas[3]);
     }
 }
 fn run(terminal: &mut DefaultTerminal) -> Result<()> {
@@ -430,6 +535,22 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                                     .any(|p| p.installed && p.cask == *cask && p.name == *name)
                             });
                             app.selected = app.selected.min(app.visible().len().saturating_sub(1));
+                            if let Some(reference) = app.focus_after_install.take() {
+                                app.tab = 1;
+                                app.query =
+                                    if app.packages.iter().any(|p| {
+                                        p.installed && p.name.eq_ignore_ascii_case(&reference)
+                                    }) {
+                                        reference
+                                    } else {
+                                        reference
+                                            .rsplit('/')
+                                            .next()
+                                            .unwrap_or(&reference)
+                                            .to_owned()
+                                    };
+                                app.selected = 0;
+                            }
                             app.status = "Ready".into();
                         }
                         Err(e) => app.status = format!("{e:#}"),
@@ -445,6 +566,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                     app.status = match result {
                         Ok(()) => "Done. Refreshing installed state…".into(),
                         Err(e) => {
+                            app.focus_after_install = None;
                             app.logs.push(format!("{e:#}"));
                             format!("{e:#}")
                         }
@@ -477,12 +599,19 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         }
         if let Some(operation) = app.confirm.take() {
             if key.code == KeyCode::Char('y') {
+                if let Operation::InstallTap(reference, _) = &operation {
+                    app.focus_after_install = Some(reference.0.clone());
+                }
                 app.busy = true;
                 app.logs.clear();
                 app.detail.clear();
                 app.status = "Running confirmed Brew command(s)…".into();
                 operate(tx.clone(), operation);
             }
+            continue;
+        }
+        if app.tap_install.is_some() {
+            app.tap_input(key);
             continue;
         }
         if app.searching {
@@ -501,6 +630,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc if !app.busy => break,
             KeyCode::Char('/') => app.searching = true,
+            KeyCode::Char('t') if !app.busy => app.tap_install = Some(TapInstall::default()),
             KeyCode::Char(c @ '1'..='3') => {
                 app.tab = c as usize - '1' as usize;
                 app.selected = 0;
@@ -699,6 +829,67 @@ mod tests {
         app.packages.clear();
         app.request_upgrade(true);
         assert!(app.confirm.is_none());
+    }
+    #[test]
+    fn tap_references_reject_options_paths_and_shell_syntax() {
+        for invalid in [
+            "",
+            "owner/tap",
+            "a/b/c/d",
+            "/b/c",
+            "a//c",
+            "a/b/..",
+            "--help/a/b",
+            "a/b/c --force",
+            "a/b/c;ls",
+            "a/b/$(id)",
+            "a/b/é",
+        ] {
+            assert!(TapReference::parse(invalid).is_err(), "accepted {invalid}");
+        }
+        assert_eq!(
+            TapReference::parse("  acme/homebrew-tools/tool@1.2+extra  ")
+                .unwrap()
+                .0,
+            "acme/homebrew-tools/tool@1.2+extra"
+        );
+    }
+    #[test]
+    fn tap_prompt_validates_edits_and_builds_typed_commands() {
+        let mut app = App::new();
+        app.tap_install = Some(TapInstall::default());
+        app.tap_input(KeyEvent::from(KeyCode::Enter));
+        assert!(app.confirm.is_none());
+        assert!(!app.tap_install.as_ref().unwrap().error.is_empty());
+        for c in "acme/tools/widgetx".chars() {
+            app.tap_input(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.tap_input(KeyEvent::from(KeyCode::Backspace));
+        app.tap_input(KeyEvent::from(KeyCode::Enter));
+        assert!(app.tap_install.is_none());
+        assert_eq!(
+            app.confirm.as_ref().unwrap().commands(),
+            vec![vec!["install", "acme/tools/widget"]]
+        );
+        for (kind, expected) in [
+            (InstallKind::Formula, "--formula"),
+            (InstallKind::Cask, "--cask"),
+        ] {
+            assert_eq!(
+                Operation::InstallTap(TapReference::parse("acme/tools/widget").unwrap(), kind)
+                    .commands(),
+                vec![vec!["install", expected, "acme/tools/widget"]]
+            );
+        }
+        app.tap_install = Some(TapInstall::default());
+        app.tap_input(KeyEvent::from(KeyCode::Char('x')));
+        app.tap_input(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.tap_install.as_ref().unwrap().input.is_empty());
+        app.tap_input(KeyEvent::from(KeyCode::Tab));
+        app.tap_input(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.tap_install.as_ref().unwrap().kind.label(), "Cask");
+        app.tap_input(KeyEvent::from(KeyCode::Esc));
+        assert!(app.tap_install.is_none());
     }
     #[test]
     fn renders_empty_and_small_terminals() {
